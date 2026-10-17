@@ -1,0 +1,189 @@
+# Axiom on one machine, against your AWS Glue, OpenMetadata and Trino (deploy/compose/README.md).
+#
+#   cp .env.example .env   # fill it in; it holds secrets, keep it mode 600 and out of git
+#   docker compose pull    # or, in the source repository: docker compose build
+#   docker compose up -d
+#
+# Bundled here: PostgreSQL (Axiom's database) and LocalStack (Axiom's own queues and event bus
+# only). Glue, S3, KMS, OpenMetadata and Trino are the real ones, configured in .env. Commits are
+# found by polling Glue (no Glue events needed). Only the portal is published; the API is behind it
+# at /v1. Every Axiom service also writes its log to ./logs/<service>.log on this machine (JSON
+# lines, debug detail, rotated); collect-logs.sh bundles them for support.
+name: axiom-deploy
+
+x-control: &control
+  image: ${AXIOM_CONTROL_IMAGE:-${AXIOM_REGISTRY:-axiom}/axiom-control:${AXIOM_VERSION:-latest}}
+  env_file: [.env]
+  environment: &control-env
+    AXIOM_ENV: ${AXIOM_ENV:-prod}
+    AXIOM_DATABASE_URL: postgresql+psycopg://axiom:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/axiom
+    # LocalStack serves only Axiom's queues and event bus; the control plane calls no other AWS API.
+    AXIOM_AWS_ENDPOINT_URL: http://localstack:4566
+    AXIOM_EVENT_BUS: axiom
+    AXIOM_OTEL_ENDPOINT: ""
+    AXIOM_LOG_DIR: /logs
+    AXIOM_LOG_LEVEL: ${AXIOM_LOG_LEVEL:-DEBUG}
+    AXIOM_CATALOGS: >-
+      [{"catalog_id": "openmetadata", "kind": "openmetadata",
+        "freshness_budget_s": ${OM_FRESHNESS_BUDGET_S:-21600},
+        "scope": ${OM_SCOPE:-{}},
+        "options": {"base_url": "${OM_BASE_URL:?set OM_BASE_URL in .env}", "token_env": "OM_TOKEN",
+                    "reconcile_interval_s": ${OM_RECONCILE_INTERVAL_S:-3600}}}]
+  volumes: ["${AXIOM_LOG_PATH:-./logs}:/logs"]
+  restart: unless-stopped
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+    queues: { condition: service_completed_successfully }
+
+x-worker: &worker
+  image: ${AXIOM_WORKER_IMAGE:-${AXIOM_REGISTRY:-axiom}/axiom-worker:${AXIOM_VERSION:-latest}}
+  env_file: [.env]
+  environment: &worker-env
+    AXIOM_ENV: ${AXIOM_ENV:-prod}
+    AWS_REGION: ${AXIOM_AWS_REGION:?set AXIOM_AWS_REGION in .env}
+    # Queues and the event bus are LocalStack's; Glue, S3 and KMS stay on real AWS.
+    AWS_ENDPOINT_URL_SQS: http://localstack:4566
+    AWS_ENDPOINT_URL_EVENTBRIDGE: http://localstack:4566
+    AXIOM_EVENT_BUS: axiom
+    AXIOM_DF_SCRATCH_DIR: /scratch
+    AXIOM_LOG_DIR: /logs
+    # Axiom's own crates in detail; libraries (AWS SDK, HTTP) at info, so no request internals.
+    RUST_LOG: ${AXIOM_WORKER_LOG:-info,axiom_worker=debug,axiom_runtime=debug,axiom_adapter_metadata=debug,axiom_adapter_datafusion=debug,axiom_adapter_trino=debug,axiom_iceberg=debug}
+  volumes: ["${AXIOM_LOG_PATH:-./logs}:/logs"]
+  tmpfs: ["/scratch:size=${AXIOM_SCRATCH_SIZE:-4g},mode=1777"]
+  restart: unless-stopped
+  depends_on:
+    queues: { condition: service_completed_successfully }
+    logs: { condition: service_completed_successfully }
+
+services:
+  logs:
+    # Makes the host log directory writable for the non-root Axiom containers.
+    image: ${AXIOM_CONTROL_IMAGE:-${AXIOM_REGISTRY:-axiom}/axiom-control:${AXIOM_VERSION:-latest}}
+    user: "0"
+    entrypoint: ["sh", "-c", "mkdir -p /logs && chmod 1777 /logs"]
+    volumes: ["${AXIOM_LOG_PATH:-./logs}:/logs"]
+    restart: "no"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: axiom
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: axiom
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axiom"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  localstack:
+    # Pinned to the version this stack was tested with (multi-arch). Queues are not persisted:
+    # `docker compose up -d` recreates them through the `queues` service.
+    image: localstack/localstack:4@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    environment:
+      SERVICES: events,sqs
+      LOCALSTACK_HOST: localstack:4566
+      SQS_ENDPOINT_STRATEGY: path
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    <<: *control
+    command: ["migrate"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: migrate }
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+      logs: { condition: service_completed_successfully }
+
+  queues:
+    <<: *control
+    command: ["local-bootstrap"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: queues }
+    restart: "no"
+    depends_on:
+      localstack: { condition: service_healthy }
+      logs: { condition: service_completed_successfully }
+
+  api:
+    <<: *control
+    command: ["api"]
+    environment:
+      <<: *control-env
+      AXIOM_LOG_NAME: api
+      AXIOM_PORTAL_URL: ${AXIOM_PORTAL_URL:-http://localhost:8080}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/health')"]
+      interval: 10s
+      retries: 12
+
+  planner:
+    # Consumes catalog-change and trigger events; most planning runs in the scheduler and API.
+    <<: *control
+    command: ["planner"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: planner }
+  relay:
+    <<: *control
+    command: ["relay"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: relay }
+  ingestor:
+    <<: *control
+    command: ["ingestor"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: ingestor }
+  scheduler:
+    <<: *control
+    command: ["scheduler"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: scheduler }
+  prober:
+    <<: *control
+    command: ["prober"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: prober }
+  dispatcher:
+    <<: *control
+    command: ["dispatcher"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: dispatcher }
+  context-sync:
+    <<: *control
+    command: ["context-sync"]
+    environment: { <<: *control-env, AXIOM_LOG_NAME: context-sync }
+
+  worker-metadata:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      AXIOM_WORKER_ENGINE: metadata
+      AXIOM_LOG_NAME: worker-metadata
+      AXIOM_QUEUE_URL: http://localstack:4566/000000000000/axiom-exec-metadata
+  worker-datafusion:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      AXIOM_WORKER_ENGINE: datafusion
+      AXIOM_LOG_NAME: worker-datafusion
+      AXIOM_QUEUE_URL: http://localstack:4566/000000000000/axiom-exec-datafusion
+  worker-trino:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      AXIOM_WORKER_ENGINE: trino
+      AXIOM_LOG_NAME: worker-trino
+      AXIOM_QUEUE_URL: http://localstack:4566/000000000000/axiom-exec-trino
+
+  portal:
+    image: ${AXIOM_PORTAL_IMAGE:-${AXIOM_REGISTRY:-axiom}/axiom-portal:${AXIOM_VERSION:-latest}}
+    environment:
+      AXIOM_API_UPSTREAM: http://api:8080
+    volumes: ["${AXIOM_LOG_PATH:-./logs}:/logs"]
+    ports: ["${AXIOM_BIND:-127.0.0.1}:${AXIOM_PORT:-8080}:8080"]
+    depends_on:
+      api: { condition: service_healthy }
+      logs: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
